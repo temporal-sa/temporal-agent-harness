@@ -171,7 +171,7 @@ class _RecordingAgentClient:
 
     calls: list[dict] = []
 
-    def __init__(self, temporal=None, workflow_id: str = "") -> None:
+    def __init__(self, temporal=None, workflow_id: str = "", event_stream=None) -> None:
         self.workflow_id = workflow_id
 
     async def submit_message(self, msg_type, payload, *, update_id=None):

@@ -23,12 +23,17 @@ from temporal_agent_harness.web.registry import load_agent_registries
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+    from temporal_agent_harness.harness.event_stream import EventStreamBackend
 
-def create_app(*registry_paths: str | Path) -> "FastAPI":
+
+def create_app(
+    *registry_paths: str | Path, event_stream: EventStreamBackend | None = None
+) -> "FastAPI":
     """Build the packaged harness web app serving the merged agents from ``registry_paths``.
 
     A single path serves just that registry's agent(s); multiple paths merge into one registry so
-    every listed agent is selectable in the UI.
+    every listed agent is selectable in the UI. ``event_stream`` is the backend the agents
+    publish to (default: each agent's own ``WorkflowStream``).
     """
     # Imported here rather than at module scope so that importing this module (e.g. to reach
     # ``create_app`` from a custom launcher) doesn't require FastAPI — it only arrives with the
@@ -38,13 +43,14 @@ def create_app(*registry_paths: str | Path) -> "FastAPI":
     if not registry_paths:
         raise ValueError("create_app requires at least one registry path.")
     registry = load_agent_registries(registry_paths)
-    return create_agent_harness_app(registry=registry)
+    return create_agent_harness_app(registry=registry, event_stream=event_stream)
 
 
 def run_server(
     *registry_paths: str | Path,
     host: str = "0.0.0.0",
     port: int = 8000,
+    event_stream: EventStreamBackend | None = None,
 ) -> None:
     """Serve the packaged web app over ``registry_paths`` until interrupted."""
     # FastAPI/uvicorn ship with the `ui` extra, not the base install. Fail with the fix rather
@@ -57,7 +63,7 @@ def run_server(
             "uv add 'temporal-agent-harness[ui]'"
         ) from exc
 
-    app = create_app(*registry_paths)
+    app = create_app(*registry_paths, event_stream=event_stream)
 
     # The console ships in the published wheel and in Bazel's build, not in the source tree, so
     # an install from a git checkout has none. Serve the API anyway (pages like the examples' talk

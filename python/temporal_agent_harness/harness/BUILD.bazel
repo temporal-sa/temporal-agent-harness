@@ -31,6 +31,7 @@ py_library(
     imports = ["../.."],
     visibility = ["//:__subpackages__"],
     deps = [
+        ":event_stream",
         "//python/temporal_agent_harness/harness/agent_protocol:__init__",
         "//python/temporal_agent_harness/harness/stream_merge:__init__",
         "//python/temporal_agent_harness/harness/stream_merge:cursor",
@@ -60,12 +61,37 @@ py_library(
     imports = ["../.."],
     visibility = ["//:__subpackages__"],
     deps = [
+        ":event_stream",
         ":stream_context",
         "//python/temporal_agent_harness/harness/agent_protocol:__init__",
         "//python/temporal_agent_harness/harness/state:__init__",
         "//python/temporal_agent_harness/harness/state:decl",
         "//python/temporal_agent_harness/harness/state:events",
         "@pypi//pydantic",
+        "@pypi//temporalio",
+    ],
+)
+
+py_library(
+    name = "event_stream",
+    srcs = ["event_stream.py"],
+    imports = ["../.."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//python/temporal_agent_harness/harness/agent_protocol:__init__",
+        "@pypi//temporalio",
+    ],
+)
+
+py_library(
+    name = "redis_event_stream",
+    srcs = ["redis_event_stream.py"],
+    imports = ["../.."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        ":event_stream",
+        "//python/temporal_agent_harness/harness/agent_protocol:__init__",
+        "@pypi//redis",
         "@pypi//temporalio",
     ],
 )

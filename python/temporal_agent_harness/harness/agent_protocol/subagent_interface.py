@@ -55,12 +55,12 @@ class RunSubagentTurnInput(BaseModel):
     )
     from_offset: int = Field(
         default=0,
-        description="Where to begin consuming the child's stream — the caller's last-known "
-        "offset (the previous turn's returned consumed_offset). A PERFORMANCE HINT ONLY, never "
-        "correctness-critical: the streamer filters to this turn's turn_id, so a stale (smaller) "
-        "offset merely replays a few already-seen events, and it can never be too large (the next "
-        "turn's events always follow the prior turn's turn_end, where the prior consumed_offset "
-        "points). So the caller need not — and must not — fetch the live stream head.",
+        description="Where this turn's events begin on the child's stream — the previous "
+        "turn's returned consumed_offset. Published on the SubagentMessageSent marker so a client "
+        "merging the parent and child streams knows where to start reading the child. It can "
+        "never be too large (the next turn's events always follow the prior turn's turn_end, "
+        "where the prior consumed_offset points), so the caller need not — and must not — fetch "
+        "the live stream head.",
     )
     # The following identify the dispatch for the SubagentMessageSent event the activity
     # publishes onto the PARENT's stream when it actually sends the message (see the activity).

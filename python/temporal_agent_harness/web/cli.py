@@ -74,7 +74,12 @@ def _serve(args: argparse.Namespace) -> None:
     # Imported at call time so `--help` on the other subcommand doesn't pay for FastAPI.
     from temporal_agent_harness.web.serve import run_server
 
-    run_server(*args.registry_paths, host=args.host, port=args.port)
+    event_stream = None
+    if args.redis_url is not None:
+        from temporal_agent_harness.harness.redis_event_stream import RedisEventStream
+
+        event_stream = RedisEventStream(args.redis_url)
+    run_server(*args.registry_paths, host=args.host, port=args.port, event_stream=event_stream)
 
 
 def _session_manager(args: argparse.Namespace) -> None:
@@ -155,6 +160,13 @@ def main(argv: list[str] | None = None) -> None:
     )
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--redis-url",
+        default=None,
+        metavar="URL",
+        help="Read agent events from Redis (for agents built with RedisEventStream) instead of "
+        "from each agent's WorkflowStream. Needs the 'redis' extra.",
+    )
     serve.set_defaults(handler=_serve)
 
     session_manager = subparsers.add_parser(

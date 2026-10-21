@@ -2,8 +2,8 @@
 # coalesces a parent agent's stream + its (recursive, possibly concurrent) subagent streams into
 # one logical stream. Two layers of tests:
 #   * pure gate logic (gates.py) — ready()/on_emit() against the bracket invariants, no I/O;
-#   * the merge engine (merge.py) — driven over scripted in-memory streams via a fake stream
-#     client, asserting EVERY merged ordering is semantically valid (within-stream order + both
+#   * the merge engine (merge.py) — driven over scripted in-memory streams via a fake event-stream
+#     backend, asserting EVERY merged ordering is semantically valid (within-stream order + both
 #     happens-before brackets), that replay is deterministic, and that recursion/concurrency work.
 #
 # The validity checker is the heart of these tests: rather than pin one exact interleaving (the
@@ -15,14 +15,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import patch
 
 import pytest
-from temporalio.contrib.workflow_streams import WorkflowStreamItem
 
-import temporal_agent_harness.harness.stream_merge.cursor as cursor_mod
 from temporal_agent_harness.harness.agent_protocol import (
-    TURN_EVENTS_TOPIC,
     AgentEvent,
     AgentEventType,
     AgentStateSnapshot,
@@ -36,6 +32,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     TurnEnded,
     TurnStarted,
 )
+from temporal_agent_harness.harness.event_stream import StoredEvent
 from temporal_agent_harness.harness.stream_merge import (
     Gates,
     MountChild,
@@ -142,7 +139,7 @@ def _tool(agent_id: str, turn: int, tid: str, *, start: bool) -> AgentEvent:
 
 
 # ---------------------------------------------------------------------------
-# Fake stream client — scripted in-memory streams, patched into cursor.py
+# Fake event-stream backend — scripted in-memory streams handed to the merge
 # ---------------------------------------------------------------------------
 
 
@@ -172,14 +169,7 @@ class _FakeHandle:
         # sibling (each delivery < stall_grace apart) must NOT keep resetting a dead child's clock.
         self._drip = drip
 
-    def subscribe(
-        self,
-        topics: Any = None,
-        from_offset: int = 0,
-        *,
-        result_type: Any = None,
-        poll_cooldown: Any = None,
-    ) -> AsyncIterator[WorkflowStreamItem[AgentEvent]]:
+    def subscribe(self, from_offset: int) -> AsyncIterator[StoredEvent]:
         events = self._events
         fail_after = self._fail_after
         live_tail = self._live_tail
@@ -187,7 +177,7 @@ class _FakeHandle:
         workflow_id = self._workflow_id
         drip = self._drip
 
-        async def gen() -> AsyncIterator[WorkflowStreamItem[AgentEvent]]:
+        async def gen() -> AsyncIterator[StoredEvent]:
             # Finite backlog then StopAsyncIteration — unlike the live server stream, which would
             # block tailing. Finite streams make the merge's ordering deterministically testable.
             # The cursor closes this generator (its `aclose`) on unmount/teardown; record that via
@@ -198,9 +188,7 @@ class _FakeHandle:
                         raise RuntimeError("simulated stream read error (e.g. update cap)")
                     if drip is not None:
                         await asyncio.sleep(drip)
-                    yield WorkflowStreamItem(
-                        topic=TURN_EVENTS_TOPIC, data=events[offset], offset=offset
-                    )
+                    yield StoredEvent(offset=offset, data=events[offset])
                 if live_tail:
                     # Block forever (until cancelled by aclose) — a live, idle workflow's poll.
                     await asyncio.Event().wait()
@@ -228,7 +216,9 @@ class _FakeStreams:
         self._live_tail_workflows = live_tail_workflows or set()
         self._drip_workflows = drip_workflows or {}
 
-    def create(self, _client: Any, workflow_id: str) -> _FakeHandle:
+    def subscribe(
+        self, _client: Any, workflow_id: str, *, from_offset: int
+    ) -> AsyncIterator[StoredEvent]:
         return _FakeHandle(
             self._streams.get(workflow_id, []),
             closes=self._closes,
@@ -236,7 +226,7 @@ class _FakeStreams:
             fail_after=self._fail_workflows.get(workflow_id),
             live_tail=workflow_id in self._live_tail_workflows,
             drip=self._drip_workflows.get(workflow_id),
-        )
+        ).subscribe(from_offset)
 
 
 async def _never_stop(_cursor: Any, _ev: AgentEvent) -> bool:
@@ -276,19 +266,19 @@ async def _run_merge(
         drip_workflows=drip_workflows,
     )
     out: list[AgentEvent] = []
-    with patch.object(cursor_mod, "WorkflowStreamClient", fake):
-        async for ev, resume_offset in merge_stream(
-            client=None,
-            root_workflow_id=root,
-            root_from_offset=root_from_offset,
-            skip_until_turn_id=skip_until_turn_id,
-            select=select,
-            should_stop=should_stop or _never_stop,
-            stall_grace_seconds=stall_grace_seconds,
-        ):
-            out.append(ev)
-            if resume_offsets is not None:
-                resume_offsets.append(resume_offset)
+    async for ev, resume_offset in merge_stream(
+        client=None,
+        event_stream=fake,
+        root_workflow_id=root,
+        root_from_offset=root_from_offset,
+        skip_until_turn_id=skip_until_turn_id,
+        select=select,
+        should_stop=should_stop or _never_stop,
+        stall_grace_seconds=stall_grace_seconds,
+    ):
+        out.append(ev)
+        if resume_offsets is not None:
+            resume_offsets.append(resume_offset)
     return out
 
 

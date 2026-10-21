@@ -202,6 +202,7 @@ opt-in:
 | `pydantic-ai` | use the **Pydantic AI** integration (`ai_sdks.pydantic_ai_harness`). |
 | `typesafe` | make typed [TypeSafe](https://docs.typesafe.ai) System One calls (`ai_sdks.typesafe_harness`), or use **`ai_sdks.jev.jev_evaluator`**, the Jev-backed auto mode evaluator; pulls in [`temporalio-typesafe`](https://pypi.org/project/temporalio-typesafe/). Register its `TypeSafePlugin` on the worker, before `AgentHarnessPlugin`. |
 | `s3` | offload large payloads to S3. The default local-filesystem driver needs nothing extra. |
+| `redis` | stream agent events through **Redis** instead of Temporal (`harness.redis_event_stream`; see [Event streams](#event-streams--workflow-or-redis)). |
 
 Combine them in one spec, e.g. `uv add 'temporal-agent-harness[ui,code-mode,genai]==0.7.0'`.
 
@@ -523,6 +524,44 @@ The worker declares only its workflows. Adding the plugin brings:
 
 Order it last, after any AI SDK's plugin, so that SDK's payload converter wins. Registering it
 on the client is enough — Temporal applies a client's plugins to workers built from it.
+
+## Event streams — workflow or Redis
+
+Everything an agent publishes (turn lifecycle, reply deltas, tool calls, approvals) goes to an
+**event stream backend**. Two ship with the harness:
+
+| Backend | Where events live | Cost |
+| --- | --- | --- |
+| `WorkflowStream()` (default) | inside the agent workflow | each activity flush is a Signal and each client read an Update: Temporal actions and history |
+| `RedisEventStream(url)` (`redis` extra) | a Redis Stream per agent | no Temporal actions or history for streaming |
+
+A backend has a side in each place events are written or read, and every side must use the
+same backend:
+
+```python
+from temporal_agent_harness.harness.redis_event_stream import RedisEventStream
+
+events = RedisEventStream("redis://localhost:6379")
+
+# The agent: workflow code needs no URL (its events go through the worker's writer).
+self._runner = AgentWorkflowRunner(config, stream=RedisEventStream(), ...)
+
+# Workers: activities publish to Redis, and the plugin runs the writer for workflow events.
+AgentHarnessPlugin(tools=MY_TOOLS, event_stream=events)
+
+# Clients reading the stream, including the web UI's server:
+AgentClient(temporal, workflow_id, event_stream=events)
+#   temporal-agent-harness serve ./agents.toml --redis-url redis://localhost:6379
+```
+
+The browser never talks to Redis: it keeps its SSE connection to the web server, which reads
+Redis for it.
+
+Redis streaming is **best effort**: events can be lost if a worker dies with events still
+queued, or Redis is down. Nothing correctness-critical depends on them — a message's result
+comes from `AgentClient.await_message(message_id)`, which reads it from the workflow itself,
+and pending approvals and callbacks are on `get_status()`. Implement
+`harness.event_stream.EventStreamBackend` to plug in another store.
 
 ## Code Mode
 

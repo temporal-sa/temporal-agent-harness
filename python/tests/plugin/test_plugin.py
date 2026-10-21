@@ -1,7 +1,8 @@
 # ABOUTME: Tests for AgentHarnessPlugin — the one plugin that wires a client + worker for the
 # harness. Covers what it registers (subagent, Jev approval, and tool activities), what it
-# refuses (a non-harness "tool"), how its data converter composes with an AI-SDK plugin's, and
-# that it never double-registers an activity a worker already passed by hand.
+# refuses (a non-harness "tool"), how its data converter composes with an AI-SDK plugin's, that
+# it never double-registers an activity a worker already passed by hand, and that its
+# ``event_stream`` reaches the activities.
 #
 # Lives in a subdirectory, not at the tests/ root: pytest prepends a test file's basedir to
 # sys.path, and a file directly under tests/ would put `tests/` there — where the namespace
@@ -11,6 +12,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
 import pytest
@@ -21,8 +23,14 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 from temporalio.workflow import ActivityConfig
 
-from temporal_agent_harness.harness import agent
-from temporal_agent_harness.harness.agent_protocol import RUN_SUBAGENT_TURN_ACTIVITY
+from temporal_agent_harness.harness import AgentWorkflowRunner, agent
+from temporal_agent_harness.harness.agent_protocol import (
+    RUN_SUBAGENT_TURN_ACTIVITY,
+    AgentEvent,
+    ReplyDelta,
+)
+from temporal_agent_harness.harness.event_stream import WorkflowStreamBackend
+from temporal_agent_harness.harness.stream_context import TurnStreamContext
 from temporal_agent_harness.plugin import AgentHarnessPlugin
 from temporal_agent_harness.utils.large_payload import (
     DEFAULT_PAYLOAD_STORAGE,
@@ -284,3 +292,55 @@ async def test_plugins_configured_storage_offloads_a_large_payload(tmp_path):
             )
     assert result == "z" * size
     assert list(tmp_path.glob("*.bin")), "the payload should have been offloaded"
+
+
+class _RecordingEventStream(WorkflowStreamBackend):
+    """The default backend, except activity publishes are kept in a list."""
+
+    def __init__(self) -> None:
+        self.published: list[AgentEvent] = []
+
+    @asynccontextmanager
+    async def activity_publisher(self, *, batch_interval: timedelta):
+        yield self
+
+    def publish(self, event: AgentEvent) -> None:
+        self.published.append(event)
+
+
+@activity.defn(name="plugin_publish_delta")
+async def _publish_delta() -> None:
+    context = TurnStreamContext(turn_id="turn-1", turn_number=1, agent_id="a1b2c3")
+    async with AgentWorkflowRunner.publisher_from_activity(context) as publisher:
+        publisher.publish(ReplyDelta(text="hello"))
+
+
+@workflow.defn(name="PluginPublishWorkflow")
+class _PublishWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        await workflow.execute_activity(
+            _publish_delta, start_to_close_timeout=timedelta(seconds=10)
+        )
+
+
+async def test_activities_publish_to_the_plugins_event_stream():
+    """``event_stream=`` reroutes what activities publish, with no change to the activity."""
+    event_stream = _RecordingEventStream()
+
+    async with await WorkflowEnvironment.start_time_skipping(
+        plugins=[AgentHarnessPlugin(event_stream=event_stream)]
+    ) as env:
+        async with Worker(
+            env.client,
+            task_queue="plugin-event-stream",
+            workflows=[_PublishWorkflow],
+            activities=[_publish_delta],
+        ):
+            await env.client.execute_workflow(
+                _PublishWorkflow.run, id="plugin-event-stream-1", task_queue="plugin-event-stream"
+            )
+
+    [published] = event_stream.published
+    assert published.event == ReplyDelta(text="hello")
+    assert published.turn_id == "turn-1"

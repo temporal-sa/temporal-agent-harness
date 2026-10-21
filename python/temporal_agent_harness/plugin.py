@@ -60,8 +60,13 @@ from typing import TYPE_CHECKING, Any
 from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import DataConverter, DefaultPayloadConverter, ExternalStorage
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import WorkerConfig
+from temporalio.worker import WorkerConfig, WorkflowRunner
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
+from temporal_agent_harness.harness.event_stream import (
+    EventStreamBackend,
+    EventStreamInterceptor,
+)
 from temporal_agent_harness.utils.large_payload import DEFAULT_PAYLOAD_STORAGE
 
 if TYPE_CHECKING:
@@ -159,6 +164,9 @@ class AgentHarnessPlugin(SimplePlugin):
       ``tools``.
     * **Filesystem activities** — the ``vfs.<name>.*`` activities of each
       :class:`~temporal_agent_harness.harness.code_mode.ActivityFileSystem` in ``filesystems``.
+    * **Event stream** — when ``event_stream`` is given: the backend activities publish agent
+      events to, anything the backend runs for the worker's lifetime, and the backend's module
+      shared into the workflow sandbox (so workflow code reaches the same worker-wide state).
 
     Args:
         tools: The agent's tools. The activity-backed ones get their durable bodies
@@ -176,6 +184,9 @@ class AgentHarnessPlugin(SimplePlugin):
             vars your deployment uses in your own startup code. Every client, worker, and
             server must end up with the same backend, or a payload offloaded by one is
             unreadable by another. ``None`` disables offloading entirely.
+        event_stream: The backend activities publish agent events to. Must match the
+            ``stream`` the worker's agents pass to ``AgentWorkflowRunner``. ``None`` keeps the
+            default, the agent workflow's own ``WorkflowStream``.
     """
 
     def __init__(
@@ -186,6 +197,7 @@ class AgentHarnessPlugin(SimplePlugin):
         # Defaulting to the shared local storage rather than to ``None`` keeps ``None`` free
         # to mean the one other thing a caller might want: no offloading at all.
         large_payload_offload: ExternalStorage | None = DEFAULT_PAYLOAD_STORAGE,
+        event_stream: EventStreamBackend | None = None,
     ) -> None:
         # Resolved eagerly so a bad `tools` entry surfaces at plugin construction, next to the
         # developer's own call, rather than deep inside Worker() where the traceback points at
@@ -198,12 +210,15 @@ class AgentHarnessPlugin(SimplePlugin):
         def data_converter(converter: DataConverter | None) -> DataConverter:
             return _data_converter(converter, offload=large_payload_offload)
 
-
-
         super().__init__(
             name="AgentHarnessPlugin",
             data_converter=data_converter,
             activities=self._append_activities,
+            interceptors=[EventStreamInterceptor(event_stream)] if event_stream else None,
+            run_context=event_stream.worker_lifetime if event_stream else None,
+            workflow_runner=(
+                _shared_with_workflows(type(event_stream).__module__) if event_stream else None
+            ),
         )
 
     def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
@@ -232,6 +247,23 @@ class AgentHarnessPlugin(SimplePlugin):
         self, activities: Sequence[Callable[..., Any]] | None
     ) -> Sequence[Callable[..., Any]]:
         return _merge_activities(activities, self._worker_activities)
+
+
+def _shared_with_workflows(
+    module: str,
+) -> Callable[[WorkflowRunner | None], WorkflowRunner]:
+    """Pass ``module`` through the workflow sandbox, so workflow code imports the worker's own
+    copy of it — and so sees the same module-level state — rather than a fresh one."""
+
+    def configure(runner: WorkflowRunner | None) -> WorkflowRunner:
+        runner = runner or SandboxedWorkflowRunner()
+        if not isinstance(runner, SandboxedWorkflowRunner):
+            return runner  # unsandboxed: workflow code already shares the worker's modules
+        return dataclasses.replace(
+            runner, restrictions=runner.restrictions.with_passthrough_modules(module)
+        )
+
+    return configure
 
 
 def _merge_activities(

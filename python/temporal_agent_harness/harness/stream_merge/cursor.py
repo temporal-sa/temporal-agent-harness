@@ -1,5 +1,5 @@
 # ABOUTME: One mounted stream's cursor for the merge — a thin peek-ahead wrapper over a single
-# agent workflow's ``WorkflowStream`` subscription. Holds at most one peeked ``head`` event, runs
+# agent workflow's event-stream subscription. Holds at most one peeked ``head`` event, runs
 # at most one in-flight ``pull`` task, and applies the root-only "skip to my turn_started" preamble
 # that establishes the quiescent start point. The engine (merge.py) owns scheduling across cursors;
 # this type owns only one stream's read position.
@@ -9,23 +9,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from datetime import timedelta
-
-from temporalio.client import Client
-from temporalio.contrib.workflow_streams import (
-    WorkflowStreamClient,
-    WorkflowStreamItem,
-)
 
 from temporal_agent_harness.harness.agent_protocol import (
-    TURN_EVENTS_TOPIC,
     AgentEvent,
     AgentEventType,
 )
-
-# subscribe() poll cadence — matches the legacy single-stream client (agent_client.py); keeps the
-# merged stream snappy without hammering the workflow when items arrive faster than a poll.
-_POLL_COOLDOWN = timedelta(milliseconds=10)
+from temporal_agent_harness.harness.event_stream import EventReader, StoredEvent
 
 _log = logging.getLogger(__name__)
 
@@ -45,7 +34,7 @@ class Cursor:
         workflow_id: str,
         is_child: bool,
         mount_index: int,
-        events: AsyncIterator[WorkflowStreamItem[AgentEvent]],
+        events: AsyncIterator[StoredEvent],
         skip_until_turn_id: str | None = None,
     ) -> None:
         self.workflow_id = workflow_id
@@ -64,7 +53,7 @@ class Cursor:
         self._skipping = skip_until_turn_id is not None
 
         self.head: AgentEvent | None = None
-        # Offset of the buffered head in THIS stream's own log (the WorkflowStreamItem.offset). The
+        # Offset of the buffered head in THIS stream's own log (the StoredEvent.offset). The
         # engine reads it as it emits each ROOT event to advance the ROOT-stream resume cursor it
         # hands back to the consumer (subagent heads don't move that cursor). -1 until a head is
         # buffered.
@@ -82,7 +71,7 @@ class Cursor:
     @classmethod
     def mount(
         cls,
-        client: Client,
+        reader: EventReader,
         *,
         workflow_id: str,
         is_child: bool,
@@ -91,12 +80,7 @@ class Cursor:
         skip_until_turn_id: str | None = None,
     ) -> "Cursor":
         """Open a subscription to ``workflow_id`` from ``from_offset`` and wrap it as a cursor."""
-        events = WorkflowStreamClient.create(client, workflow_id).subscribe(
-            topics=[TURN_EVENTS_TOPIC],
-            from_offset=from_offset,
-            result_type=AgentEvent,
-            poll_cooldown=_POLL_COOLDOWN,
-        )
+        events = reader.subscribe(workflow_id, from_offset=from_offset)
         return cls(
             workflow_id=workflow_id,
             is_child=is_child,
@@ -123,7 +107,7 @@ class Cursor:
         try:
             while True:
                 item = await anext(self._events)
-                ev = item.data  # subscribe yields WorkflowStreamItem; .data is the AgentEvent
+                ev = item.data  # subscribe yields StoredEvent; .data is the AgentEvent
                 if self._skipping:
                     if (
                         ev.event.type == AgentEventType.TURN_STARTED

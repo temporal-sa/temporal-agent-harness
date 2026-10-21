@@ -17,6 +17,7 @@ py_library(
     imports = ["../../.."],
     visibility = ["//:__subpackages__"],
     deps = [
+        "//python/temporal_agent_harness/harness:event_stream",
         "//python/temporal_agent_harness/harness/agent_protocol:__init__",
         "@pypi//temporalio",
     ],
@@ -38,6 +39,7 @@ py_library(
     deps = [
         ":cursor",
         ":gates",
+        "//python/temporal_agent_harness/harness:event_stream",
         "//python/temporal_agent_harness/harness/agent_protocol:__init__",
         "@pypi//temporalio",
     ],

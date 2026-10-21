@@ -13,6 +13,7 @@ py_library(
     imports = [".."],
     visibility = ["//:__subpackages__"],
     deps = [
+        "//python/temporal_agent_harness/harness:event_stream",
         "//python/temporal_agent_harness/harness:subagent_activities",
         "//python/temporal_agent_harness/harness/code_mode:__init__",
         "//python/temporal_agent_harness/harness/code_mode:activity_fs",

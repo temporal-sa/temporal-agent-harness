@@ -23,6 +23,7 @@ harness_pytest_test(
         "//python/examples/tictactoe:board",  # keep
         "//python/examples/tictactoe:workflow",  # keep
         "//python/temporal_agent_harness/harness:agent_schema",
+        "//python/temporal_agent_harness/harness:redis_event_stream",
         "//python/temporal_agent_harness/web:cli",
         "//python/temporal_agent_harness/web:client",
         "//python/temporal_agent_harness/web:registry",

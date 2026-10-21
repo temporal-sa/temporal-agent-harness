@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 SEND_AGENT_MESSAGE_UPDATE = "send_agent_message"
 TOOL_APPROVAL_UPDATE = "tool_approval"
 PROVIDE_CALLBACK_RESULT_UPDATE = "provide_callback_result"
+AWAIT_MESSAGE_UPDATE = "await_message"
 AGENT_STATUS_QUERY = "agent_status"
 AGENT_INTERFACE_QUERY = "agent_interface"
 
@@ -891,6 +892,28 @@ class AgentMessageReply:
     message_id: str
     disposition: MessageDisposition
     accepted_offset: int = 0
+
+
+@dataclass
+class MessageResult:
+    """Returned by the workflow's ``await_message`` update once a message is finished.
+
+    A message is finished when its handler has returned or raised AND the turn it ran in has
+    ended, so nothing it started is still running. Exactly one of ``output`` / ``error`` is set.
+
+    This is the durable way to get a message's outcome: it does not depend on reading the
+    event stream, so it is unaffected by a backend that drops or delays events.
+
+    ``stream_offset`` is the head of the agent's event stream just past the turn's
+    ``turn_end`` — where a reader that only cares about later turns can start.
+    """
+
+    message_id: str
+    turn_id: str
+    turn_number: int
+    output: dict[str, Any] | None = None
+    error: str | None = None
+    stream_offset: int = 0
 
 
 @dataclass

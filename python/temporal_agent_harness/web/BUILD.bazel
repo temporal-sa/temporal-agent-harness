@@ -35,6 +35,7 @@ py_library(
         ":task_queue_status",
         "//python/temporal_agent_harness:plugin",
         "//python/temporal_agent_harness/harness:agent_client",
+        "//python/temporal_agent_harness/harness:event_stream",
         "//python/temporal_agent_harness/harness/agent_protocol:__init__",
         "//python/temporal_agent_harness/ui:__init__",
         "//python/temporal_agent_harness/utils:large_payload",
@@ -56,6 +57,7 @@ harness_module_binary(
         ":session_manager",
         ":session_manager_worker",
         "//python/temporal_agent_harness/harness:agent_schema",
+        "//python/temporal_agent_harness/harness:redis_event_stream",
     ],
 )
 
@@ -105,6 +107,7 @@ py_library(
         ":__init__",
         ":client",
         ":registry",
+        "//python/temporal_agent_harness/harness:event_stream",
         "//python/temporal_agent_harness/ui:__init__",
         "@pypi//fastapi",
         "@pypi//uvicorn",
