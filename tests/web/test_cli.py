@@ -268,7 +268,7 @@ def test_serve_checks_temporal_before_binding_the_port(
         calls.append("verify")
 
     monkeypatch.setattr("temporal_agent_harness.web.serve.verify_temporal_reachable", fake_verify)
-    monkeypatch.setattr("temporal_agent_harness.web.serve.create_app", lambda *_: "app")
+    monkeypatch.setattr("temporal_agent_harness.web.serve.create_app", lambda *_, **__: "app")
     monkeypatch.setitem(
         __import__("sys").modules,
         "uvicorn",
@@ -320,3 +320,20 @@ def test_schema_protocol_prints_the_event_protocol(capsys: pytest.CaptureFixture
 def test_schema_needs_exactly_one_of_an_agent_or_protocol(argv: list[str]) -> None:
     with pytest.raises(SystemExit, match="give an agent class or --protocol"):
         main(argv)
+
+
+def test_serve_reads_from_redis_when_given_a_redis_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    from temporal_agent_harness.harness.redis_event_stream import RedisEventStream
+
+    captured: dict[str, object] = {}
+
+    def fake_run(*registry_paths: str, event_stream: object = None, **_kwargs: object) -> None:
+        captured["event_stream"] = event_stream
+
+    monkeypatch.setattr("temporal_agent_harness.web.serve.run_server", fake_run)
+
+    main(["serve", "agents.toml"])
+    assert captured["event_stream"] is None
+
+    main(["serve", "agents.toml", "--redis-url", "redis://localhost:6379"])
+    assert isinstance(captured["event_stream"], RedisEventStream)

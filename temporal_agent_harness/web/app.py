@@ -42,6 +42,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     AgentStatus,
     SEND_AGENT_MESSAGE_UPDATE,
 )
+from temporal_agent_harness.harness.event_stream import EventStreamBackend
 from temporal_agent_harness.plugin import AgentHarnessPlugin
 from temporal_agent_harness.ui import packaged_ui_dist
 from temporal_agent_harness.utils.large_payload import DEFAULT_PAYLOAD_STORAGE
@@ -119,6 +120,12 @@ class CallbackResultRequestBody(BaseModel):
     error: str | None = None
 
 
+def _agent_client(app: FastAPI, workflow_id: str) -> AgentClient:
+    return AgentClient(
+        app.state.temporal, workflow_id, event_stream=app.state.event_stream
+    )
+
+
 def create_agent_harness_app(
     *,
     registry: RegistrySource | None = None,
@@ -129,6 +136,7 @@ def create_agent_harness_app(
     index_file: str = "index.html",
     states_file: str | None = None,
     large_payload_offload: ExternalStorage | None = DEFAULT_PAYLOAD_STORAGE,
+    event_stream: EventStreamBackend | None = None,
 ) -> FastAPI:
     """Create the reusable harness web API.
 
@@ -147,6 +155,9 @@ def create_agent_harness_app(
             default is single-host only; build
             :func:`~temporal_agent_harness.utils.large_payload.s3_payload_storage` in your
             own async startup and pass it for a multi-host deploy.
+        event_stream: Where the agents publish their events, read here to stream them to the
+            browser. Must match the agents' backend; defaults to each agent's own
+            ``WorkflowStream``.
     """
 
     static_path = Path(static_dir) if static_dir is not None else packaged_ui_dist()
@@ -178,6 +189,7 @@ def create_agent_harness_app(
         yield
 
     app = FastAPI(lifespan=lifespan)
+    app.state.event_stream = event_stream
     # Filled at startup; empty means every agent's start interface is unknown.
     app.state.agent_starts = {}
     # Open CORS: this is a local dev server whose API is meant to be driven by any client,
@@ -281,7 +293,7 @@ def create_agent_harness_app(
 
     @app.get("/api/status/{session_id}")
     async def get_status(session_id: str):
-        client = AgentClient(temporal=app.state.temporal, workflow_id=session_id)
+        client = _agent_client(app, session_id)
         status = await client.get_status()
         content = TypeAdapter(AgentStatus).dump_python(status, mode="json")
         return JSONResponse(content=content, headers={"Cache-Control": "no-store"})
@@ -297,13 +309,13 @@ def create_agent_harness_app(
 
     @app.get("/api/agent-interface/{session_id}")
     async def agent_interface(session_id: str):
-        client = AgentClient(temporal=app.state.temporal, workflow_id=session_id)
+        client = _agent_client(app, session_id)
         functions = await client.get_agent_interface()
         return JSONResponse(content=[fn.model_dump(mode="json") for fn in functions])
 
     @app.get("/api/attach")
     async def attach(session_id: str, from_offset: int = 0) -> StreamingResponse:
-        client = AgentClient(temporal=app.state.temporal, workflow_id=session_id)
+        client = _agent_client(app, session_id)
         return StreamingResponse(
             await client.attach(on_item=_yield_item, from_offset=from_offset),
             media_type="text/event-stream",
@@ -312,7 +324,7 @@ def create_agent_harness_app(
 
     @app.post("/api/approve")
     async def approve_tool(req: ToolApprovalRequestBody):
-        client = AgentClient(temporal=app.state.temporal, workflow_id=req.session_id)
+        client = _agent_client(app, req.session_id)
         result = await client.approve_tool(
             req.tool_id,
             approved=req.approved,
@@ -327,7 +339,7 @@ def create_agent_harness_app(
         machine submits the result (or an error), keyed by the ``tool_id`` from the
         ``callback_requested`` event. Forwards to the workflow's ``provide_callback_result``
         update; the result is validated against the tool's declared output type there."""
-        client = AgentClient(temporal=app.state.temporal, workflow_id=req.session_id)
+        client = _agent_client(app, req.session_id)
         result = await client.provide_callback_result(
             req.tool_id, result=req.result, error=req.error
         )
@@ -354,7 +366,7 @@ def create_agent_harness_app(
 
     @app.post("/api/messages")
     async def submit_message(req: ChatRequestBody):
-        client = AgentClient(temporal=app.state.temporal, workflow_id=req.session_id)
+        client = _agent_client(app, req.session_id)
         if isinstance(req.message, str):
             msg_type, payload = "ask", {"text": req.message}
         else:
@@ -382,7 +394,7 @@ def create_agent_harness_app(
                 case _:
                     return _yield_item(item, resume_offset)
 
-        client = AgentClient(temporal=app.state.temporal, workflow_id=req.session_id)
+        client = _agent_client(app, req.session_id)
         if isinstance(req.message, str):
             msg_type, payload = "ask", {"text": req.message}
         else:

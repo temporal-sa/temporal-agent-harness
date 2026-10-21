@@ -6,27 +6,30 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
-from types import SimpleNamespace
+from contextlib import asynccontextmanager
+from datetime import timedelta
 
 import pytest
 from pydantic import BaseModel, Field
 from temporalio.exceptions import ApplicationError
+from temporalio.testing import ActivityEnvironment
 
 from temporal_agent_harness.harness import agent
 from temporal_agent_harness.harness.agent_protocol import (
     AgentEvent,
-    MessageHandlerEnd,
-    MessageHandlerError,
+    AgentMessageReply,
+    MessageDisposition,
+    MessageResult,
     RunSubagentTurnInput,
     SubagentMessageSent,
     SubagentStarted,
     SubagentStopped,
     ToolApprovalPolicy,
-    TurnEnded,
 )
 from temporal_agent_harness.harness.agent_workflow import _SubagentInstance, _WorkflowStatus
-from temporal_agent_harness.harness import subagent_activities
+from temporal_agent_harness.harness import agent_workflow, subagent_activities
 from temporal_agent_harness.harness.subagent_activities import (
     SubagentActivities,
     _TurnProgress,
@@ -364,161 +367,108 @@ def test_distinct_subagents_have_independent_gates_and_counters():
 
 
 # ---------------------------------------------------------------------------
-# The activity picks ITS OWN reply out of a shared child turn
+# run_subagent_turn: send to the child, then wait on its await_message update
 # ---------------------------------------------------------------------------
-#
-# A child turn is refcounted: a human (or anything else) sending the child a MidTurn.ACCEPT
-# message mid-turn JOINS the turn this activity opened, and the turn then carries one
-# message_handler_end per participant under one turn_id. Selecting "the last reply on the turn"
-# would hand the parent's model ANOTHER message's output as this tool call's result — silent
-# corruption of a tool result, not a rendering gap. These drive _consume_child_turn over a
-# scripted child stream, which is the only way to script that interleaving deterministically.
 
 
-class _FakeItem:
-    """One ``WorkflowStreamItem``: an offset plus the decoded ``AgentEvent``."""
+class _FakeChild:
+    """Stands in for the ``AgentClient`` the activity builds for the child agent."""
 
-    def __init__(self, offset: int, data: AgentEvent) -> None:
-        self.offset = offset
-        self.data = data
+    def __init__(self, result: MessageResult) -> None:
+        self.result = result
+        self.sent: list[str] = []
+        self.awaited: list[str] = []
 
+    async def _submit_message(self, msg_type: str, payload: dict, *, update_id: str) -> AgentMessageReply:
+        self.sent.append(msg_type)
+        return AgentMessageReply(
+            turn_number=4,
+            turn_id="child-turn-4",
+            message_id="ours",
+            disposition=MessageDisposition.OPENED,
+        )
 
-class _FakeStream:
-    def __init__(self, items: list[_FakeItem]) -> None:
-        self._items = items
-
-    def subscribe(self, **_kwargs):
-        async def gen():
-            for item in self._items:
-                yield item
-
-        return gen()
-
-
-def _child_event(payload, *, turn_id: str, message_id: str | None) -> AgentEvent:
-    return AgentEvent(
-        agent_id="child",
-        turn_id=turn_id,
-        turn_number=4,
-        message_id=message_id,
-        timestamp=0.0,
-        event=payload,
-    )
+    async def await_message(self, message_id: str) -> MessageResult:
+        self.awaited.append(message_id)
+        return self.result
 
 
-def _shared_child_turn(*, ours: str, theirs: str) -> list[_FakeItem]:
-    """One child turn with two participants — ours replying FIRST, so "last wins" is wrong."""
-    turn_id = "child-turn-4"
-    payloads = [
-        (MessageHandlerEnd(output={"text": "ours"}), ours),
-        (MessageHandlerEnd(output={"text": "theirs"}), theirs),
-        (TurnEnded(), None),
-    ]
-    return [
-        _FakeItem(i, _child_event(payload, turn_id=turn_id, message_id=mid))
-        for i, (payload, mid) in enumerate(payloads)
-    ]
+class _RecordingBackend:
+    """An event-stream backend that records what activities publish."""
+
+    def __init__(self) -> None:
+        self.published: list[AgentEvent] = []
+
+    @asynccontextmanager
+    async def activity_publisher(self, *, batch_interval: timedelta):
+        yield self
+
+    def publish(self, event: AgentEvent) -> None:
+        self.published.append(event)
 
 
-def _consume(items: list[_FakeItem], monkeypatch):
-    """Run ``_consume_child_turn`` over ``items``, returning ``(output, got_reply)``."""
-    activities = SubagentActivities(client=None)  # the stream client is patched out
-    monkeypatch.setattr(
-        subagent_activities,
-        "WorkflowStreamClient",
-        SimpleNamespace(create=lambda _client, _wf: _FakeStream(items)),
-    )
+def _child_result(**fields) -> MessageResult:
+    return MessageResult(message_id="ours", turn_id="child-turn-4", turn_number=4, **fields)
+
+
+def _run_turn(child: _FakeChild, monkeypatch, *, heartbeat_details=()):
+    """Run the activity against ``child``; return ``(result, events published to the parent)``."""
+    backend = _RecordingBackend()
+    monkeypatch.setattr(subagent_activities, "AgentClient", lambda _client, _workflow_id: child)
+    monkeypatch.setattr(agent_workflow, "activity_backend", lambda: backend)
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(env.info, heartbeat_details=list(heartbeat_details))
     req = RunSubagentTurnInput(
         child_workflow_id="child-wf",
         type="ask",
         payload={},
+        from_offset=3,
         handle="aaaaaa-bbbbbb",
         agent_key="sample",
         parent_stream_context=TurnStreamContext(
             turn_id="parent-turn-1", turn_number=1, agent_id="aaaaaa"
         ),
     )
-    progress = _TurnProgress(
-        sent=True,
-        turn_id="child-turn-4",
-        turn_number=4,
-        message_id="ours",
-        consumed_offset=0,
-    )
-    return asyncio.run(activities._consume_child_turn(req, progress))
+    activities = SubagentActivities(client=None)  # the child client is patched out
+    result = asyncio.run(env.run(activities.run_subagent_turn, req))
+    return result, backend.published
 
 
-def test_shared_child_turn_returns_our_reply_not_the_last_one(monkeypatch):
-    output, got_reply = _consume(
-        _shared_child_turn(ours="ours", theirs="theirs"), monkeypatch
-    )
-    assert got_reply is True
-    # "theirs" was published later under the SAME turn_id. Last-reply-wins would return it.
-    assert output == {"text": "ours"}
+def test_returns_the_childs_result_and_where_its_turn_ended(monkeypatch):
+    child = _FakeChild(_child_result(output={"text": "ours"}, stream_offset=17))
+
+    result, published = _run_turn(child, monkeypatch)
+
+    assert child.awaited == ["ours"]
+    assert result.output == {"text": "ours"}
+    assert result.turn_number == 4
+    assert result.consumed_offset == 17
+    # The dispatch marker lands on the parent's stream, through the configured backend.
+    [dispatch] = [e.event for e in published]
+    assert isinstance(dispatch, SubagentMessageSent)
+    assert dispatch.subagent_turn == 4
+    assert dispatch.from_offset == 3
 
 
-def test_another_participants_error_is_not_our_tool_call_failing(monkeypatch):
-    turn_id = "child-turn-4"
-    items = [
-        _FakeItem(
-            0,
-            _child_event(
-                MessageHandlerError(message="their handler blew up"),
-                turn_id=turn_id,
-                message_id="theirs",
-            ),
-        ),
-        _FakeItem(
-            1,
-            _child_event(
-                MessageHandlerEnd(output={"text": "ours"}),
-                turn_id=turn_id,
-                message_id="ours",
-            ),
-        ),
-        _FakeItem(2, _child_event(TurnEnded(), turn_id=turn_id, message_id=None)),
-    ]
-    # A sibling participant failing says nothing about this tool call, so it must not be
-    # raised as SubagentTurnError — our own reply is right there behind it.
-    output, got_reply = _consume(items, monkeypatch)
-    assert got_reply is True
-    assert output == {"text": "ours"}
+def test_a_child_handler_error_fails_the_tool_call(monkeypatch):
+    child = _FakeChild(_child_result(error="child blew up"))
 
-
-def test_our_own_error_still_fails_the_tool_call(monkeypatch):
-    turn_id = "child-turn-4"
-    items = [
-        _FakeItem(
-            0,
-            _child_event(
-                MessageHandlerError(message="ours blew up"),
-                turn_id=turn_id,
-                message_id="ours",
-            ),
-        ),
-        _FakeItem(1, _child_event(TurnEnded(), turn_id=turn_id, message_id=None)),
-    ]
     with pytest.raises(ApplicationError) as excinfo:
-        _consume(items, monkeypatch)
+        _run_turn(child, monkeypatch)
+
     assert excinfo.value.type == "SubagentTurnError"
-    assert "ours blew up" in str(excinfo.value)
+    assert "child blew up" in str(excinfo.value)
+    # The parent closes the dispatch bracket on this turn number.
+    assert excinfo.value.details == ({"subagent_turn": 4},)
 
 
-def test_turn_end_with_no_reply_for_us_reports_no_reply(monkeypatch):
-    turn_id = "child-turn-4"
-    items = [
-        _FakeItem(
-            0,
-            _child_event(
-                MessageHandlerEnd(output={"text": "theirs"}),
-                turn_id=turn_id,
-                message_id="theirs",
-            ),
-        ),
-        _FakeItem(1, _child_event(TurnEnded(), turn_id=turn_id, message_id=None)),
-    ]
-    # Only a sibling replied. The activity must report "no reply" (which the caller turns into
-    # SubagentNoReply) rather than adopting someone else's output.
-    output, got_reply = _consume(items, monkeypatch)
-    assert got_reply is False
-    assert output == {}
+def test_a_retry_after_the_send_waits_without_resending(monkeypatch):
+    child = _FakeChild(_child_result(output={"text": "ours"}))
+    memo = _TurnProgress(sent=True, turn_id="child-turn-4", turn_number=4, message_id="ours")
+
+    result, published = _run_turn(child, monkeypatch, heartbeat_details=[memo.model_dump()])
+
+    assert child.sent == []
+    assert published == []
+    assert child.awaited == ["ours"]
+    assert result.output == {"text": "ours"}

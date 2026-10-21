@@ -14,13 +14,13 @@ from typing import Any, TypeVar
 from pydantic import BaseModel
 
 from temporalio.client import Client, WithStartWorkflowOperation, WorkflowUpdateFailedError
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
 
 from temporalio.common import WorkflowIDConflictPolicy
 
 from temporal_agent_harness.harness.agent_protocol import (
     AGENT_INTERFACE_QUERY,
     AGENT_STATUS_QUERY,
+    AWAIT_MESSAGE_UPDATE,
     PROVIDE_CALLBACK_RESULT_UPDATE,
     SEND_AGENT_MESSAGE_UPDATE,
     TOOL_APPROVAL_UPDATE,
@@ -32,12 +32,17 @@ from temporal_agent_harness.harness.agent_protocol import (
     AgentStatus,
     CallbackResult,
     MessageDisposition,
+    MessageResult,
     CallbackResultAck,
     PendingApproval,
     PendingCallback,
     ToolApprovalDecision,
     ToolApprovalResult,
     AgentMessageReply,
+)
+from temporal_agent_harness.harness.event_stream import (
+    EventStreamBackend,
+    WorkflowStreamBackend,
 )
 from temporal_agent_harness.harness.stream_merge import (
     DEFAULT_STALL_GRACE_SECONDS,
@@ -154,15 +159,20 @@ class AgentClient:
     Args:
         temporal: Connected Temporal client.
         workflow_id: ID of the agent workflow to interact with.
+        event_stream: Where the agent publishes its events. Must match the backend the agent
+            was built with; defaults to the agent's own ``WorkflowStream``.
     """
 
     def __init__(
         self,
         temporal: Client,
         workflow_id: str,
+        *,
+        event_stream: EventStreamBackend | None = None,
     ) -> None:
         self._temporal = temporal
         self._workflow_id = workflow_id
+        self._event_stream = event_stream or WorkflowStreamBackend()
 
     @property
     def workflow_id(self) -> str:
@@ -172,6 +182,18 @@ class AgentClient:
         """Query the workflow for its current status."""
         handle = self._temporal.get_workflow_handle(self._workflow_id)
         return await handle.query(AGENT_STATUS_QUERY, result_type=AgentStatus)
+
+    async def await_message(self, message_id: str) -> MessageResult:
+        """Wait for a message sent to this agent to finish, and return its result.
+
+        ``message_id`` is the id on the :class:`AgentMessageReply` the send returned. Unlike
+        reading the event stream, this works with any event-stream backend, however lossy, and
+        can be repeated (after a reconnect, or from an activity retry) for the same result.
+        """
+        handle = self._temporal.get_workflow_handle(self._workflow_id)
+        return await handle.execute_update(
+            AWAIT_MESSAGE_UPDATE, message_id, result_type=MessageResult
+        )
 
     async def get_pending_approvals(self) -> list[PendingApproval]:
         """The gated tool calls currently awaiting a human decision.
@@ -518,6 +540,7 @@ class AgentClient:
 
         merged = merge_stream(
             client=self._temporal,
+            event_stream=self._event_stream,
             root_workflow_id=self._workflow_id,
             root_from_offset=reply.accepted_offset,
             skip_until_turn_id=target_turn_id,
@@ -604,9 +627,8 @@ class AgentClient:
         the last participant of a turn finishes, so it is a true quiescence signal — which is
         what lets a caller safely disconnect instead of holding the stream open forever.
         """
-        stream = WorkflowStreamClient.create(self._temporal, self._workflow_id)
         status = await self.get_status()
-        head = await stream.get_offset()
+        head = await self._event_stream.head_offset(self._temporal, self._workflow_id)
         # Already caught up (no events past from_offset) and the agent is idle — nothing to stream.
         if head <= from_offset and not status.turn_active and not status.pending_turns:
             return self._empty()
@@ -679,6 +701,7 @@ class AgentClient:
 
         merged = merge_stream(
             client=self._temporal,
+            event_stream=self._event_stream,
             root_workflow_id=root_id,
             root_from_offset=from_offset,
             skip_until_turn_id=None,

@@ -76,6 +76,7 @@ from temporal_agent_harness.harness.agent_workflow import (
     AgentInitData,
     agent_init_data,
 )
+from temporal_agent_harness.harness.event_stream import WorkflowStreamBackend
 from temporal_agent_harness.harness.stream_context import TurnStreamContext
 
 
@@ -1988,3 +1989,66 @@ async def test_resend_under_the_same_update_id_is_one_message(client_and_queue):
     assert await _wait_for_seen(handle, 2) == ["greet:Ada", "greet:Ada"]
     status = await handle.query(AGENT_STATUS_QUERY, result_type=AgentStatus)
     assert status.current_turn == 2 and status.pending_turns == []
+
+
+# ---------------------------------------------------------------------------
+# await_message: a message's result without reading the event stream
+# ---------------------------------------------------------------------------
+
+
+async def test_await_message_returns_each_participants_own_result(client_and_queue):
+    """Two messages sharing one turn each get their own result, not the turn's last reply."""
+    client, task_queue = client_and_queue
+    handle, work = await _hold_a_turn_open(client, task_queue)
+    joined = await _send(handle, "outlive", {"text": "after you"})
+    agent_client = AgentClient(client, handle.id)
+
+    await handle.signal(MidTurnProbeAgent.release, "outlive")
+    await handle.signal(MidTurnProbeAgent.release, "work")
+    work_result = await agent_client.await_message(work.message_id)
+    joined_result = await agent_client.await_message(joined.message_id)
+
+    assert work_result.output == {"text": "worked:long"}
+    assert joined_result.output == {"text": "outlived:after you"}
+    assert work_result.error is None and joined_result.error is None
+    assert work_result.turn_id == joined_result.turn_id == work.turn_id
+
+
+async def test_await_message_waits_for_the_turn_to_end(client_and_queue):
+    """A finished participant's result is held until the turn it joined has ended, so a
+    caller never acts while something the message joined is still running."""
+    client, task_queue = client_and_queue
+    handle, work = await _hold_a_turn_open(client, task_queue)
+    joined = await _send(handle, "outlive", {"text": "after you"})
+    agent_client = AgentClient(client, handle.id)
+
+    await handle.signal(MidTurnProbeAgent.release, "outlive")
+    waiting = asyncio.create_task(agent_client.await_message(joined.message_id))
+    await asyncio.sleep(0.5)
+    assert not waiting.done()
+
+    await handle.signal(MidTurnProbeAgent.release, "work")
+    result = await asyncio.wait_for(waiting, timeout=30)
+    assert result.output == {"text": "outlived:after you"}
+    # The offset sits just past the turn's turn_end: the agent is idle, so it is the head.
+    assert result.stream_offset == await WorkflowStreamBackend().head_offset(client, handle.id)
+
+
+async def test_await_message_reports_a_handler_error(client_and_queue):
+    client, task_queue = client_and_queue
+    handle = await _start(client, task_queue, TypedProbeAgent)
+    reply = await _send(handle, "boom", {"text": "now"})
+
+    result = await AgentClient(client, handle.id).await_message(reply.message_id)
+
+    assert result.output is None
+    assert result.error == "boom: now"
+
+
+async def test_await_message_rejects_an_unknown_message(client_and_queue):
+    client, task_queue = client_and_queue
+    handle = await _start(client, task_queue, TypedProbeAgent)
+
+    with pytest.raises(WorkflowUpdateFailedError) as excinfo:
+        await AgentClient(client, handle.id).await_message("never-sent")
+    assert getattr(excinfo.value.cause, "type", None) == "UnknownMessage"

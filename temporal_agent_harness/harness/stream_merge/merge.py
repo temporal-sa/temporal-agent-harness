@@ -18,6 +18,11 @@ from temporal_agent_harness.harness.agent_protocol import (
     SubagentReplyReceived,
     SubagentStreamUnavailable,
 )
+from temporal_agent_harness.harness.event_stream import (
+    EventReader,
+    EventStreamBackend,
+    WorkflowStreamBackend,
+)
 from temporal_agent_harness.harness.stream_merge.cursor import Cursor
 from temporal_agent_harness.harness.stream_merge.gates import (
     Gates,
@@ -83,8 +88,9 @@ class _Merge:
         select: SelectPolicy,
         should_stop: ShouldStop,
         stall_grace_seconds: float = DEFAULT_STALL_GRACE_SECONDS,
+        event_stream: EventStreamBackend | None = None,
     ) -> None:
-        self._client = client
+        self._reader = EventReader(event_stream or WorkflowStreamBackend(), client)
         self._select = select
         self._should_stop = should_stop
         self._stall_grace = stall_grace_seconds
@@ -144,7 +150,7 @@ class _Merge:
             # Resuming there again would lose nothing — seed the resume offset to the start point.
             self._root_resume_offset = from_offset
         self._cursors[workflow_id] = Cursor.mount(
-            self._client,
+            self._reader,
             workflow_id=workflow_id,
             is_child=is_child,
             mount_index=self._mount_seq,
@@ -460,6 +466,7 @@ async def merge_stream(
     select: SelectPolicy,
     should_stop: ShouldStop,
     stall_grace_seconds: float = DEFAULT_STALL_GRACE_SECONDS,
+    event_stream: EventStreamBackend | None = None,
 ) -> AsyncIterator[MergedItem]:
     """Drive one gated k-way merge, yielding ``(event, resume_offset)`` pairs (see :data:`MergedItem`).
 
@@ -482,6 +489,7 @@ async def merge_stream(
     reply before that give-up (a liveness backstop, not an ordering input)."""
     engine = _Merge(
         client=client,
+        event_stream=event_stream,
         select=select,
         should_stop=should_stop,
         stall_grace_seconds=stall_grace_seconds,
